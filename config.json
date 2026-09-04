@@ -1,0 +1,28 @@
+{
+  "application_name": "BLADE",
+  "policy_wait_seconds": 1800,
+  "encryption_poll_seconds": 30,
+  "policy_poll_seconds": 20,
+  "global_timeout_hours": 8,
+  "minimum_free_disk_mb": 1024,
+  "corporate_dns_markers": [
+    "ocp"
+  ],
+  "fast_sync_actions": [
+    "021",
+    "022",
+    "071",
+    "121"
+  ],
+  "allow_automatic_ccmrepair": false,
+  "allow_automatic_reboot": false,
+  "require_action_confirmation": true,
+  "enable_ccmcache_discovery": true,
+  "enable_sccm_log_evidence": true,
+  "policy_retry_seconds": [
+    300,
+    900
+  ],
+  "max_policy_attempts": 3,
+  "adaptive_full_sync": true
+}

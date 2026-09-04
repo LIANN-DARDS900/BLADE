@@ -1,0 +1,804 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet(
+        'preflight',
+        'sccm_health',
+        'bitlocker_status',
+        'policy_evidence',
+        'fast_sync',
+        'policy_request',
+        'full_sync',
+        'adaptive_sync',
+        'gpupdate',
+        'repair_sccm_basic',
+        'ccmeval',
+        'ccmrepair',
+        'pending_reboot',
+        'ccmcache_discovery',
+        'sccm_log_evidence'
+    )]
+    [string]$Operation,
+
+    [string]$CorporateMarkers = 'ocp',
+
+    [int]$MinimumFreeDiskMB = 1024
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Write-StructuredResult {
+    param(
+        [bool]$Success,
+        [string]$Status,
+        [string]$Message,
+        [object]$Data = @{},
+        [string]$ErrorCode = ''
+    )
+    $result = [ordered]@{
+        success   = $Success
+        status    = $Status
+        message   = $Message
+        data      = $Data
+        errorCode = $(if ($ErrorCode) { $ErrorCode } else { $null })
+    }
+    $result | ConvertTo-Json -Compress -Depth 10
+}
+
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch { return $false }
+}
+
+function Get-MachineInformation {
+    $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    return [ordered]@{
+        computerName = $env:COMPUTERNAME
+        manufacturer = $(if ($computer) { [string]$computer.Manufacturer } else { 'Unknown' })
+        model = $(if ($computer) { [string]$computer.Model } else { 'Unknown' })
+        serialNumber = $(if ($bios) { [string]$bios.SerialNumber } else { 'Unknown' })
+        operatingSystem = $(if ($os) { [string]$os.Caption } else { 'Unknown' })
+        osBuild = $(if ($os) { [string]$os.BuildNumber } else { 'Unknown' })
+    }
+}
+
+function Get-NetworkInformation {
+    $adapters = @()
+    try {
+        $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {
+            $_.Status -eq 'Up' -and
+            $_.InterfaceDescription -notmatch '(?i)wireless|wi-fi|wifi|bluetooth'
+        })
+    }
+    catch { }
+
+    $ipv4 = @()
+    foreach ($adapter in $adapters) {
+        try {
+            $addresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction Stop |
+                Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' })
+            foreach ($address in $addresses) { $ipv4 += [string]$address.IPAddress }
+        }
+        catch { }
+    }
+
+    $dnsSuffixes = @()
+    try {
+        $dnsSuffixes = @(Get-DnsClient -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -in $adapters.Name } |
+            ForEach-Object { $_.ConnectionSpecificSuffix } |
+            Where-Object { $_ } |
+            Select-Object -Unique)
+    }
+    catch { }
+
+    $domain = ''
+    try { $domain = [string](Get-CimInstance Win32_ComputerSystem).Domain } catch { }
+    $siteCode = ''
+    try { $siteCode = [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client' -Name AssignedSiteCode -ErrorAction Stop).AssignedSiteCode } catch { }
+
+    $corporateEvidence = @()
+    $markers = @($CorporateMarkers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($marker in $markers) {
+        if ($domain -match ([regex]::Escape($marker))) { $corporateEvidence += "Domain=$domain" }
+        foreach ($suffix in $dnsSuffixes) {
+            if ($suffix -match ([regex]::Escape($marker))) { $corporateEvidence += "DNS=$suffix" }
+        }
+    }
+    if ($siteCode) { $corporateEvidence += "SCCM site=$siteCode" }
+    $corporateEvidence = @($corporateEvidence | Select-Object -Unique)
+
+    $connected = ($adapters.Count -gt 0 -and $ipv4.Count -gt 0)
+    $summary = if ($connected) {
+        "$($adapters[0].Name) · $($ipv4 -join ', ')"
+    } else {
+        'No active physical Ethernet adapter with a valid IPv4 address'
+    }
+    return [ordered]@{
+        ethernetConnected = $connected
+        adapterNames = @($adapters | ForEach-Object { [string]$_.Name })
+        ipv4Addresses = $ipv4
+        dnsSuffixes = $dnsSuffixes
+        domain = $domain
+        corporateNetworkLikely = ($corporateEvidence.Count -gt 0)
+        corporateEvidence = $corporateEvidence
+        summary = $summary
+    }
+}
+
+function Get-TpmInformation {
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        return [ordered]@{
+            present = [bool]$tpm.TpmPresent
+            ready = [bool]$tpm.TpmReady
+            enabled = [bool]$tpm.TpmEnabled
+            activated = [bool]$tpm.TpmActivated
+            owned = [bool]$tpm.TpmOwned
+            error = ''
+        }
+    }
+    catch {
+        return [ordered]@{
+            present = $false
+            ready = $false
+            enabled = $false
+            activated = $false
+            owned = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-PowerInformation {
+    try {
+        $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $battery) {
+            return [ordered]@{
+                hasBattery = $false
+                acConnected = $true
+                chargePercentage = 100
+                summary = 'No battery detected; external power assumed'
+            }
+        }
+        $powerOnline = $false
+        try {
+            $status = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStatus -ErrorAction Stop | Select-Object -First 1
+            if ($status) { $powerOnline = [bool]$status.PowerOnline }
+        }
+        catch {
+            $powerOnline = ([int]$battery.BatteryStatus -in @(2,6,7,8,9,11))
+        }
+        $charge = [int]$battery.EstimatedChargeRemaining
+        return [ordered]@{
+            hasBattery = $true
+            acConnected = $powerOnline
+            chargePercentage = $charge
+            summary = $(if ($powerOnline) { "AC connected · Battery $charge%" } else { "Running on battery · $charge%" })
+        }
+    }
+    catch {
+        return [ordered]@{
+            hasBattery = $false
+            acConnected = $false
+            chargePercentage = 0
+            summary = "Power status unavailable: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-FreeDiskSpaceMB {
+    param([string]$Drive = 'C:')
+    try {
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$Drive'" -ErrorAction Stop
+        return [int64]([double]$disk.FreeSpace / 1MB)
+    }
+    catch { return 0 }
+}
+
+function Get-SccmHealth {
+    $ccmExe = 'C:\Windows\CCM\CcmExec.exe'
+    $ccmEval = 'C:\Windows\CCM\CcmEval.exe'
+    $ccmRepair = 'C:\Windows\CCM\ccmrepair.exe'
+    $service = Get-Service CcmExec -ErrorAction SilentlyContinue
+    $wmi = Get-Service Winmgmt -ErrorAction SilentlyContinue
+    $namespaceExists = $false
+    $smsClientExists = $false
+    $triggerCapable = $false
+    try {
+        $client = Get-CimInstance -Namespace 'root\ccm' -ClassName SMS_Client -ErrorAction Stop
+        $namespaceExists = $true
+        $smsClientExists = ($null -ne $client)
+        $class = Get-CimClass -Namespace 'root\ccm' -ClassName SMS_Client -ErrorAction Stop
+        $triggerCapable = ($null -ne ($class.CimClassMethods | Where-Object { $_.Name -eq 'TriggerSchedule' }))
+    }
+    catch { }
+
+    $siteCode = ''
+    try { $siteCode = [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client' -Name AssignedSiteCode -ErrorAction Stop).AssignedSiteCode } catch { }
+    $managementPoint = ''
+    try {
+        $mp = Get-CimInstance -Namespace 'root\ccm\LocationServices' -ClassName SMS_ActiveMPCandidate -ErrorAction Stop |
+            Select-Object -First 1
+        if ($mp) { $managementPoint = [string]$mp.MP }
+    }
+    catch { }
+    if (-not $managementPoint) {
+        try { $managementPoint = [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\CCM' -Name LastValidMP -ErrorAction Stop).LastValidMP } catch { }
+    }
+
+    $issues = @()
+    if (-not (Test-Path $ccmExe)) { $issues += 'CcmExec.exe is missing' }
+    if (-not $service) { $issues += 'CcmExec service is missing' }
+    elseif ($service.Status -ne 'Running') { $issues += "CcmExec service is $($service.Status)" }
+    if (-not $wmi -or $wmi.Status -ne 'Running') { $issues += 'Windows Management Instrumentation is not running' }
+    if (-not $namespaceExists) { $issues += 'root\ccm namespace is unavailable' }
+    if (-not $smsClientExists) { $issues += 'SMS_Client class is unavailable' }
+    if (-not $triggerCapable) { $issues += 'TriggerSchedule is unavailable' }
+    if (-not $siteCode) { $issues += 'No SCCM site assignment detected' }
+
+    $healthy = (
+        (Test-Path $ccmExe) -and
+        $service -and $service.Status -eq 'Running' -and
+        $wmi -and $wmi.Status -eq 'Running' -and
+        $namespaceExists -and $smsClientExists -and $triggerCapable -and
+        [bool]$siteCode
+    )
+    $summary = if (-not (Test-Path $ccmExe) -and -not $service) { 'CLIENT_NOT_INSTALLED' }
+        elseif ($healthy) { 'HEALTHY' }
+        else { 'UNHEALTHY' }
+
+    return [ordered]@{
+        healthy = [bool]$healthy
+        healthSummary = $summary
+        executableExists = Test-Path $ccmExe
+        serviceExists = [bool]$service
+        serviceStatus = $(if ($service) { [string]$service.Status } else { 'Missing' })
+        wmiStatus = $(if ($wmi) { [string]$wmi.Status } else { 'Missing' })
+        ccmNamespaceExists = $namespaceExists
+        smsClientExists = $smsClientExists
+        triggerScheduleCapable = $triggerCapable
+        siteCode = $(if ($siteCode) { $siteCode } else { 'N/A' })
+        managementPoint = $(if ($managementPoint) { $managementPoint } else { 'N/A' })
+        ccmEvalExists = Test-Path $ccmEval
+        ccmRepairExists = Test-Path $ccmRepair
+        issues = $issues
+    }
+}
+
+function Get-BitLockerInformation {
+    try {
+        $volume = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+        $protectors = @()
+        if ($volume.KeyProtector) {
+            $protectors = @($volume.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType } | Select-Object -Unique)
+        }
+        $protection = [string]$volume.ProtectionStatus
+        $volumeStatus = [string]$volume.VolumeStatus
+        $percentage = [int]$volume.EncryptionPercentage
+        return [ordered]@{
+            available = $true
+            protectionStatus = $protection
+            volumeStatus = $volumeStatus
+            encryptionPercentage = $percentage
+            encryptionMethod = [string]$volume.EncryptionMethod
+            keyProtectorTypes = $protectors
+            protectionOn = ($protection -eq 'On')
+            fullyEncrypted = ($volumeStatus -eq 'FullyEncrypted')
+            suspended = ($volumeStatus -eq 'FullyEncrypted' -and $protection -ne 'On')
+            encryptionStarted = ($percentage -gt 0 -or $volumeStatus -eq 'EncryptionInProgress')
+            error = ''
+        }
+    }
+    catch {
+        return [ordered]@{
+            available = $false
+            protectionStatus = 'Unknown'
+            volumeStatus = 'Unknown'
+            encryptionPercentage = 0
+            encryptionMethod = 'Unknown'
+            keyProtectorTypes = @()
+            protectionOn = $false
+            fullyEncrypted = $false
+            suspended = $false
+            encryptionStarted = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-ExceptionHResultHex {
+    param([object]$Exception)
+    try {
+        $signed = [int64]$Exception.HResult
+        $unsigned = [uint32]($signed -band 0xFFFFFFFFL)
+        return ('0x{0:X8}' -f $unsigned)
+    }
+    catch { return '' }
+}
+
+function Invoke-SccmSchedules {
+    param(
+        [System.Collections.IDictionary]$Schedules,
+        [string[]]$MandatoryScheduleIds = @()
+    )
+    $results = @()
+    $allOk = $true
+    foreach ($item in $Schedules.GetEnumerator()) {
+        $scheduleId = [string]$item.Value
+        $optional = -not ($MandatoryScheduleIds -contains $scheduleId)
+        try {
+            $response = Invoke-CimMethod -Namespace 'root\ccm' -ClassName SMS_Client `
+                -MethodName TriggerSchedule -Arguments @{ sScheduleID = $scheduleId } -ErrorAction Stop
+            $returnValue = 0
+            if ($null -ne $response.ReturnValue) { $returnValue = [int]$response.ReturnValue }
+            $ok = ($returnValue -eq 0)
+            if (-not $ok) { $allOk = $false }
+            $results += [ordered]@{
+                name = [string]$item.Key
+                scheduleId = $scheduleId
+                success = $ok
+                skipped = $false
+                supported = $true
+                optional = $optional
+                status = $(if ($ok) { 'success' } else { 'failed' })
+                returnValue = $returnValue
+                hresult = ''
+                error = $(if ($ok) { '' } else { "TriggerSchedule returned $returnValue." })
+            }
+        }
+        catch {
+            $errorText = [string]$_.Exception.Message
+            $hresult = Get-ExceptionHResultHex -Exception $_.Exception
+            $unsupported = (
+                $hresult -eq '0x80041002' -or
+                $errorText -match '(?i)0x80041002|WBEM_E_NOT_FOUND|not found|non trouvé|introuvable'
+            )
+            if ($optional -and $unsupported) {
+                $results += [ordered]@{
+                    name = [string]$item.Key
+                    scheduleId = $scheduleId
+                    success = $true
+                    skipped = $true
+                    supported = $false
+                    optional = $true
+                    status = 'skipped'
+                    returnValue = -1
+                    hresult = $hresult
+                    error = 'Schedule is not registered on this SCCM client.'
+                }
+            }
+            else {
+                $allOk = $false
+                $results += [ordered]@{
+                    name = [string]$item.Key
+                    scheduleId = $scheduleId
+                    success = $false
+                    skipped = $false
+                    supported = -not $unsupported
+                    optional = $optional
+                    status = 'failed'
+                    returnValue = -1
+                    hresult = $hresult
+                    error = $errorText
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 600
+    }
+    $succeeded = @($results | Where-Object { $_.status -eq 'success' }).Count
+    $skipped = @($results | Where-Object { $_.status -eq 'skipped' }).Count
+    $failed = @($results | Where-Object { $_.status -eq 'failed' }).Count
+    return [ordered]@{
+        success = $allOk
+        actions = $results
+        succeeded = $succeeded
+        skipped = $skipped
+        failed = $failed
+    }
+}
+
+function Test-PolicyEvidence {
+    $evidence = @()
+    try {
+        $fve = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -ErrorAction Stop
+        $policyNames = @(
+            'EnableBDEWithNoTPM', 'RequireActiveDirectoryBackup', 'OSEncryptionType',
+            'FDVEncryptionType', 'ActiveDirectoryBackup', 'OSRequireActiveDirectoryBackup',
+            'EncryptionMethodWithXtsOs', 'EncryptionMethodWithXtsFdv',
+            'UseAdvancedStartup', 'ConfigureAdvancedStartup'
+        )
+        $found = @($policyNames | Where-Object { $null -ne $fve.$_ })
+        if ($found.Count -gt 0) { $evidence += "FVE policy: $($found -join ', ')" }
+    }
+    catch { }
+
+    $handlerLog = 'C:\Windows\CCM\Logs\BitLockerManagementHandler.log'
+    if (Test-Path $handlerLog) {
+        try {
+            $item = Get-Item $handlerLog
+            if ($item.LastWriteTime -gt (Get-Date).AddMinutes(-120)) {
+                $tail = @(Get-Content $handlerLog -Tail 80 -ErrorAction Stop)
+                $safeLines = @($tail | Where-Object {
+                    $_ -match '(?i)policy|BitLocker|enforce|encrypt|handler|management|evaluation' -and
+                    $_ -notmatch '(?i)RecoveryPassword|RecoveryKey|numericalpassword|[0-9]{6}-[0-9]{6}'
+                })
+                if ($safeLines.Count -gt 0) { $evidence += 'Recent BitLockerManagementHandler activity' }
+            }
+        }
+        catch { }
+    }
+
+    $bitlocker = Get-BitLockerInformation
+    if ($bitlocker.encryptionStarted) { $evidence += 'BitLocker encryption has started' }
+    return [ordered]@{
+        policyFound = ($evidence.Count -gt 0)
+        evidence = $evidence
+        encryptionStarted = [bool]$bitlocker.encryptionStarted
+        bitlocker = $bitlocker
+    }
+}
+
+function Test-PendingRebootState {
+    $reasons = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $reasons += 'Component Based Servicing'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $reasons += 'Windows Update'
+    }
+    try {
+        $sessionManager = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
+        if ($sessionManager.PendingFileRenameOperations) { $reasons += 'Pending file rename operations' }
+    }
+    catch { }
+    return [ordered]@{ pending = ($reasons.Count -gt 0); reasons = $reasons }
+}
+
+function Get-CcmCacheEvidence {
+    $root = 'C:\Windows\ccmcache'
+    if (-not (Test-Path $root)) {
+        return [ordered]@{
+            available = $false
+            root = $root
+            scannedFiles = 0
+            relevantFiles = @()
+            packageFolders = @()
+            message = 'The SCCM cache folder does not exist.'
+        }
+    }
+
+    $namePattern = '(?i)bitlocker|mbam|encrypt|encryption|tpm|recovery|escrow|protector|compliance|remediation|ocp'
+    $contentPattern = '(?i)BitLocker|MBAM|manage-bde|Enable-BitLocker|Get-BitLockerVolume|Win32_EncryptableVolume|RecoveryPassword|KeyProtector|ProtectKeyWithTPM|Escrow|encryption'
+    $textExtensions = @('.ps1','.psm1','.bat','.cmd','.vbs','.xml','.ini','.txt','.log','.json')
+    $relevant = @()
+    $scanned = 0
+    $contentScanned = 0
+
+    try {
+        $files = @(Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1200)
+        foreach ($file in $files) {
+            $scanned++
+            $matches = @()
+            if ($file.Name -match $namePattern) { $matches += 'filename' }
+            if ($textExtensions -contains $file.Extension.ToLowerInvariant() -and $file.Length -le 1MB -and $contentScanned -lt 300) {
+                $contentScanned++
+                try {
+                    $hit = Select-String -Path $file.FullName -Pattern $contentPattern -List -ErrorAction Stop
+                    if ($hit) { $matches += 'content' }
+                }
+                catch { }
+            }
+            if ($matches.Count -gt 0) {
+                $relevant += [ordered]@{
+                    cacheFolder = [string](Split-Path $file.DirectoryName -Leaf)
+                    fileName = [string]$file.Name
+                    extension = [string]$file.Extension
+                    sizeKB = [math]::Round([double]$file.Length / 1KB, 1)
+                    lastWriteTime = $file.LastWriteTime.ToString('s')
+                    matchTypes = @($matches | Select-Object -Unique)
+                    relativePath = [string]$file.FullName.Substring($root.Length).TrimStart('\')
+                }
+            }
+            if ($relevant.Count -ge 80) { break }
+        }
+    }
+    catch { }
+
+    $folders = @($relevant | Group-Object cacheFolder | ForEach-Object {
+        [ordered]@{
+            cacheFolder = [string]$_.Name
+            relevantFileCount = [int]$_.Count
+            files = @($_.Group | Select-Object -ExpandProperty fileName -Unique)
+        }
+    })
+    return [ordered]@{
+        available = $true
+        root = $root
+        scannedFiles = $scanned
+        contentScannedFiles = $contentScanned
+        relevantFiles = $relevant
+        packageFolders = $folders
+        message = $(if ($relevant.Count -gt 0) { "Found $($relevant.Count) potentially relevant cached files." } else { 'No BitLocker-related cached files were identified.' })
+    }
+}
+
+function Get-SccmLogEvidence {
+    $logRoot = 'C:\Windows\CCM\Logs'
+    $logNames = @(
+        'BitLockerManagementHandler.log','AppEnforce.log','AppDiscovery.log','ExecMgr.log',
+        'PolicyAgent.log','PolicyEvaluator.log','CIAgent.log','DCMAgent.log','CAS.log',
+        'ContentTransferManager.log','LocationServices.log','CcmExec.log','CcmEval.log'
+    )
+    $pattern = '(?i)BitLocker|MBAM|encrypt|encryption|policy|TriggerSchedule|ccmcache|compliance|baseline|deployment|management point|assigned site'
+    $exclude = '(?i)RecoveryPassword|RecoveryKey|numericalpassword|key material|[0-9]{6}-[0-9]{6}-[0-9]{6}'
+    $evidence = @()
+    $availableLogs = @()
+
+    foreach ($name in $logNames) {
+        $path = Join-Path $logRoot $name
+        if (-not (Test-Path $path)) { continue }
+        $availableLogs += $name
+        try {
+            $tail = @(Get-Content $path -Tail 500 -ErrorAction Stop)
+            $matches = @($tail | Where-Object { $_ -match $pattern -and $_ -notmatch $exclude } | Select-Object -Last 12)
+            foreach ($line in $matches) {
+                $safeLine = [string]$line
+                if ($safeLine.Length -gt 500) { $safeLine = $safeLine.Substring(0,500) }
+                $evidence += [ordered]@{
+                    log = $name
+                    line = $safeLine
+                    lastWriteTime = (Get-Item $path).LastWriteTime.ToString('s')
+                }
+                if ($evidence.Count -ge 80) { break }
+            }
+        }
+        catch { }
+        if ($evidence.Count -ge 80) { break }
+    }
+
+    return [ordered]@{
+        available = (Test-Path $logRoot)
+        logRoot = $logRoot
+        availableLogs = $availableLogs
+        evidence = $evidence
+        message = $(if ($evidence.Count -gt 0) { "Collected $($evidence.Count) sanitized SCCM log evidence lines." } else { 'No recent BitLocker or policy evidence was found in the selected SCCM logs.' })
+    }
+}
+
+try {
+    switch ($Operation) {
+        'preflight' {
+            $machine = Get-MachineInformation
+            $network = Get-NetworkInformation
+            $tpm = Get-TpmInformation
+            $sccm = Get-SccmHealth
+            $bitlocker = Get-BitLockerInformation
+            $pendingReboot = Test-PendingRebootState
+            $power = Get-PowerInformation
+            $admin = Test-IsAdministrator
+            $freeMB = Get-FreeDiskSpaceMB
+            $powerShellAvailable = [bool](Get-Command powershell.exe -ErrorAction SilentlyContinue)
+
+            $checks = @(
+                [ordered]@{ name='Administrator'; state=$(if ($admin) {'Ready'} else {'Blocked'}); detail=$(if ($admin) {'Elevated process'} else {'Relaunch as Administrator'}); status=$(if ($admin) {'ready'} else {'blocked'}) },
+                [ordered]@{ name='PowerShell'; state=$(if ($powerShellAvailable) {'Ready'} else {'Blocked'}); detail='Process execution-policy bypass will be applied'; status=$(if ($powerShellAvailable) {'ready'} else {'blocked'}) },
+                [ordered]@{ name='Ethernet'; state=$(if ($network.ethernetConnected) {'Connected'} else {'Disconnected'}); detail=$network.summary; status=$(if ($network.ethernetConnected) {'ready'} else {'blocked'}) },
+                [ordered]@{ name='Corporate network'; state=$(if ($network.corporateNetworkLikely) {'Detected'} else {'Unconfirmed'}); detail=$(if ($network.corporateEvidence.Count -gt 0) {$network.corporateEvidence -join '; '} else {'Ethernet is present, but configured corporate-network evidence was not found'}); status=$(if ($network.corporateNetworkLikely) {'ready'} else {'warning'}) },
+                [ordered]@{ name='TPM'; state=$(if ($tpm.ready) {'Ready'} elseif ($tpm.present) {'Not ready'} else {'Not detected'}); detail=$(if ($tpm.error) {$tpm.error} else {"Enabled=$($tpm.enabled), Activated=$($tpm.activated)"}); status=$(if ($tpm.ready) {'ready'} else {'blocked'}) },
+                [ordered]@{ name='SCCM client'; state=$sccm.healthSummary; detail=$(if ($sccm.issues.Count -gt 0) {$sccm.issues -join '; '} else {'Client is healthy'}); status=$(if ($sccm.healthy) {'ready'} elseif (-not $sccm.executableExists -and -not $sccm.serviceExists) {'blocked'} else {'warning'}) },
+                [ordered]@{ name='AC power'; state=$(if ($power.acConnected) {'Connected'} else {'Battery'}); detail=$power.summary; status=$(if ($power.acConnected) {'ready'} else {'warning'}) },
+                [ordered]@{ name='Disk space'; state="${freeMB} MB free"; detail="Minimum $MinimumFreeDiskMB MB for logs and policy operations"; status=$(if ($freeMB -ge $MinimumFreeDiskMB) {'ready'} else {'blocked'}) },
+                [ordered]@{ name='Pending reboot'; state=$(if ($pendingReboot.pending) {'Pending'} else {'None'}); detail=$(if ($pendingReboot.pending) {$pendingReboot.reasons -join '; '} else {'No standard reboot flag detected'}); status=$(if ($pendingReboot.pending) {'warning'} else {'ready'}) },
+                [ordered]@{ name='BitLocker'; state="$($bitlocker.encryptionPercentage)%"; detail="Protection=$($bitlocker.protectionStatus), Volume=$($bitlocker.volumeStatus)"; status=$(if ($bitlocker.fullyEncrypted -and $bitlocker.protectionOn) {'ready'} else {'waiting'}) }
+            )
+
+            $minimumReady = ($admin -and $powerShellAvailable -and $network.ethernetConnected -and $tpm.ready -and $freeMB -ge $MinimumFreeDiskMB -and $sccm.executableExists)
+            $message = if ($minimumReady) { 'Minimum prerequisites are ready. Review warnings before deployment.' }
+                else { 'One or more minimum prerequisites are blocking deployment.' }
+            Write-StructuredResult -Success $minimumReady -Status $(if ($minimumReady) {'ready'} else {'blocked'}) `
+                -Message $message -Data @{
+                    minimumReady = $minimumReady
+                    machine = $machine
+                    network = $network
+                    tpm = $tpm
+                    sccm = $sccm
+                    bitlocker = $bitlocker
+                    pendingReboot = $pendingReboot
+                    power = $power
+                    freeDiskMB = $freeMB
+                    checks = $checks
+                } -ErrorCode $(if ($minimumReady) {''} else {'PREFLIGHT_BLOCKED'})
+        }
+        'sccm_health' {
+            $health = Get-SccmHealth
+            Write-StructuredResult -Success $health.healthy -Status $(if ($health.healthy) {'ready'} else {'warning'}) `
+                -Message $(if ($health.healthy) {'SCCM client is healthy.'} else {'SCCM client needs remediation.'}) `
+                -Data $health -ErrorCode $(if ($health.healthy) {''} else {'SCCM_UNHEALTHY'})
+        }
+        'bitlocker_status' {
+            $status = Get-BitLockerInformation
+            Write-StructuredResult -Success $status.available -Status $(if ($status.fullyEncrypted -and $status.protectionOn) {'success'} elseif ($status.encryptionStarted) {'running'} else {'waiting'}) `
+                -Message $(if (-not $status.available) {'BitLocker status is unavailable.'} elseif ($status.fullyEncrypted -and $status.protectionOn) {'BitLocker is fully encrypted and protected.'} elseif ($status.encryptionStarted) {"BitLocker encryption is in progress at $($status.encryptionPercentage)%."} else {'BitLocker encryption has not started.'}) `
+                -Data $status -ErrorCode $(if ($status.available) {''} else {'BITLOCKER_STATUS_UNAVAILABLE'})
+        }
+        'policy_evidence' {
+            $policy = Test-PolicyEvidence
+            Write-StructuredResult -Success $true -Status $(if ($policy.policyFound) {'ready'} else {'waiting'}) `
+                -Message $(if ($policy.policyFound) {'BitLocker policy evidence detected.'} else {'No BitLocker policy evidence detected yet.'}) `
+                -Data $policy
+        }
+        'policy_request' {
+            $id021 = '{00000000-0000-0000-0000-000000000021}'
+            $id022 = '{00000000-0000-0000-0000-000000000022}'
+            $schedules = [ordered]@{
+                'Machine Policy Assignments Request (021)' = $id021
+                'Machine Policy Evaluation (022)' = $id022
+            }
+            $sync = Invoke-SccmSchedules -Schedules $schedules -MandatoryScheduleIds @($id021, $id022)
+            Write-StructuredResult -Success $sync.success -Status $(if ($sync.success) {'success'} else {'warning'}) `
+                -Message $(if ($sync.success) {'Machine policy request and evaluation were triggered.'} else {'Machine policy retry returned an error.'}) `
+                -Data $sync -ErrorCode $(if ($sync.success) {''} else {'SCCM_POLICY_RETRY_FAILED'})
+        }
+        'fast_sync' {
+            $id021 = '{00000000-0000-0000-0000-000000000021}'
+            $id022 = '{00000000-0000-0000-0000-000000000022}'
+            $schedules = [ordered]@{
+                'Machine Policy Assignments Request (021)' = $id021
+                'Machine Policy Evaluation (022)' = $id022
+                'Compliance Settings Evaluation (071)' = '{00000000-0000-0000-0000-000000000071}'
+                'Application Deployment Evaluation (121)' = '{00000000-0000-0000-0000-000000000121}'
+            }
+            $sync = Invoke-SccmSchedules -Schedules $schedules -MandatoryScheduleIds @($id021, $id022)
+            $summary = "Focused SCCM sync: $($sync.succeeded) succeeded, $($sync.skipped) skipped, $($sync.failed) failed."
+            Write-StructuredResult -Success $sync.success -Status $(if ($sync.success) {'success'} else {'warning'}) `
+                -Message $summary -Data $sync -ErrorCode $(if ($sync.success) {''} else {'SCCM_SYNC_FAILURE'})
+        }
+        'full_sync' {
+            $id021 = '{00000000-0000-0000-0000-000000000021}'
+            $id022 = '{00000000-0000-0000-0000-000000000022}'
+            $schedules = [ordered]@{
+                'Machine Policy Assignments Request (021)' = $id021
+                'Machine Policy Evaluation (022)' = $id022
+                'Hardware Inventory (001)' = '{00000000-0000-0000-0000-000000000001}'
+                'Software Inventory (002)' = '{00000000-0000-0000-0000-000000000002}'
+                'Discovery Data Collection (003)' = '{00000000-0000-0000-0000-000000000003}'
+                'Software Updates Scan (113)' = '{00000000-0000-0000-0000-000000000113}'
+                'Software Updates Deployment Evaluation (108)' = '{00000000-0000-0000-0000-000000000108}'
+                'Compliance Settings Evaluation (071)' = '{00000000-0000-0000-0000-000000000071}'
+                'Application Deployment Evaluation (121)' = '{00000000-0000-0000-0000-000000000121}'
+                'Windows Installer Source Update (032)' = '{00000000-0000-0000-0000-000000000032}'
+            }
+            $sync = Invoke-SccmSchedules -Schedules $schedules -MandatoryScheduleIds @($id021, $id022)
+            $summary = "Adaptive SCCM refresh: $($sync.succeeded) succeeded, $($sync.skipped) unsupported/skipped, $($sync.failed) failed."
+            Write-StructuredResult -Success $sync.success -Status $(if ($sync.success) {'success'} else {'warning'}) `
+                -Message $summary -Data $sync -ErrorCode $(if ($sync.success) {''} else {'SCCM_ADAPTIVE_SYNC_FAILURE'})
+        }
+        'adaptive_sync' {
+            $id021 = '{00000000-0000-0000-0000-000000000021}'
+            $id022 = '{00000000-0000-0000-0000-000000000022}'
+            $schedules = [ordered]@{
+                'Machine Policy Assignments Request (021)' = $id021
+                'Machine Policy Evaluation (022)' = $id022
+                'Hardware Inventory (001)' = '{00000000-0000-0000-0000-000000000001}'
+                'Software Inventory (002)' = '{00000000-0000-0000-0000-000000000002}'
+                'Discovery Data Collection (003)' = '{00000000-0000-0000-0000-000000000003}'
+                'Software Updates Scan (113)' = '{00000000-0000-0000-0000-000000000113}'
+                'Software Updates Deployment Evaluation (108)' = '{00000000-0000-0000-0000-000000000108}'
+                'Compliance Settings Evaluation (071)' = '{00000000-0000-0000-0000-000000000071}'
+                'Application Deployment Evaluation (121)' = '{00000000-0000-0000-0000-000000000121}'
+                'Windows Installer Source Update (032)' = '{00000000-0000-0000-0000-000000000032}'
+            }
+            $sync = Invoke-SccmSchedules -Schedules $schedules -MandatoryScheduleIds @($id021, $id022)
+            $summary = "Adaptive SCCM refresh: $($sync.succeeded) succeeded, $($sync.skipped) unsupported/skipped, $($sync.failed) failed."
+            Write-StructuredResult -Success $sync.success -Status $(if ($sync.success) {'success'} else {'warning'}) `
+                -Message $summary -Data $sync -ErrorCode $(if ($sync.success) {''} else {'SCCM_ADAPTIVE_SYNC_FAILURE'})
+        }
+        'gpupdate' {
+            $output = @(& gpupdate.exe /target:computer /force /wait:60 2>&1 | ForEach-Object { [string]$_ })
+            $exitCode = $LASTEXITCODE
+            $ok = ($exitCode -eq 0)
+            Write-StructuredResult -Success $ok -Status $(if ($ok) {'success'} else {'warning'}) `
+                -Message $(if ($ok) {'Computer Group Policy update completed.'} else {"Group Policy returned exit code $exitCode."}) `
+                -Data @{ exitCode=$exitCode; output=$output } -ErrorCode $(if ($ok) {''} else {'GPUPDATE_WARNING'})
+        }
+        'repair_sccm_basic' {
+            $actions = @()
+            $wmi = Get-Service Winmgmt -ErrorAction SilentlyContinue
+            if ($wmi -and $wmi.Status -ne 'Running') {
+                Start-Service Winmgmt -ErrorAction Stop
+                $actions += 'Started Winmgmt'
+            }
+            $ccm = Get-Service CcmExec -ErrorAction SilentlyContinue
+            if (-not $ccm) {
+                Write-StructuredResult -Success $false -Status 'blocked' -Message 'CcmExec service is not installed.' -Data @{actions=$actions} -ErrorCode 'SCCM_NOT_INSTALLED'
+                break
+            }
+            if ($ccm.Status -eq 'Running') {
+                Restart-Service CcmExec -Force -ErrorAction Stop
+                $actions += 'Restarted CcmExec'
+            }
+            else {
+                Start-Service CcmExec -ErrorAction Stop
+                $actions += 'Started CcmExec'
+            }
+            Start-Sleep -Seconds 5
+            $health = Get-SccmHealth
+            Write-StructuredResult -Success $true -Status $(if ($health.healthy) {'success'} else {'warning'}) `
+                -Message $(if ($health.healthy) {'Basic SCCM remediation completed and the client is healthy.'} else {'Basic SCCM remediation completed; additional evaluation is needed.'}) `
+                -Data @{actions=$actions; health=$health}
+        }
+        'ccmeval' {
+            $path = 'C:\Windows\CCM\CcmEval.exe'
+            if (-not (Test-Path $path)) {
+                Write-StructuredResult -Success $false -Status 'blocked' -Message 'CcmEval.exe was not found.' -ErrorCode 'CCMEVAL_NOT_FOUND'
+                break
+            }
+            $process = Start-Process -FilePath $path -PassThru -WindowStyle Hidden
+            $deadline = (Get-Date).AddMinutes(15)
+            while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 2
+                $process.Refresh()
+            }
+            if (-not $process.HasExited) {
+                Write-StructuredResult -Success $false -Status 'waiting' -Message 'CcmEval is still running after 15 minutes. It was left running; recheck SCCM health later.' -Data @{processId=$process.Id} -ErrorCode 'CCMEVAL_STILL_RUNNING'
+                break
+            }
+            Start-Sleep -Seconds 5
+            $health = Get-SccmHealth
+            Write-StructuredResult -Success $true -Status $(if ($health.healthy) {'success'} else {'warning'}) `
+                -Message $(if ($health.healthy) {'CcmEval completed and SCCM is healthy.'} else {'CcmEval completed, but SCCM still needs attention.'}) `
+                -Data @{exitCode=$process.ExitCode; health=$health}
+        }
+        'ccmrepair' {
+            $path = 'C:\Windows\CCM\ccmrepair.exe'
+            if (-not (Test-Path $path)) {
+                Write-StructuredResult -Success $false -Status 'blocked' -Message 'ccmrepair.exe was not found.' -ErrorCode 'CCMREPAIR_NOT_FOUND'
+                break
+            }
+            $process = Start-Process -FilePath $path -PassThru -WindowStyle Hidden
+            $deadline = (Get-Date).AddMinutes(30)
+            while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 3
+                $process.Refresh()
+            }
+            if (-not $process.HasExited) {
+                Write-StructuredResult -Success $false -Status 'waiting' -Message 'ccmrepair is still running after 30 minutes. It was left running; recheck SCCM health later.' -Data @{processId=$process.Id} -ErrorCode 'CCMREPAIR_STILL_RUNNING'
+                break
+            }
+            Write-StructuredResult -Success $true -Status 'warning' -Message 'ccmrepair completed. Recheck SCCM health and reboot only if Windows reports it is required.' `
+                -Data @{exitCode=$process.ExitCode; pendingReboot=(Test-PendingRebootState)}
+        }
+        'ccmcache_discovery' {
+            $cache = Get-CcmCacheEvidence
+            Write-StructuredResult -Success $true -Status $(if ($cache.relevantFiles.Count -gt 0) {'ready'} else {'waiting'}) `
+                -Message $cache.message -Data $cache
+        }
+        'sccm_log_evidence' {
+            $logs = Get-SccmLogEvidence
+            Write-StructuredResult -Success $true -Status $(if ($logs.evidence.Count -gt 0) {'ready'} else {'waiting'}) `
+                -Message $logs.message -Data $logs
+        }
+        'pending_reboot' {
+            $pending = Test-PendingRebootState
+            Write-StructuredResult -Success $true -Status $(if ($pending.pending) {'warning'} else {'ready'}) `
+                -Message $(if ($pending.pending) {'Windows reports a pending reboot.'} else {'No standard pending reboot flag was detected.'}) `
+                -Data $pending
+        }
+    }
+}
+catch {
+    Write-StructuredResult -Success $false -Status 'failed' -Message $_.Exception.Message -Data @{} -ErrorCode 'UNHANDLED_POWERSHELL_ERROR'
+    exit 1
+}
