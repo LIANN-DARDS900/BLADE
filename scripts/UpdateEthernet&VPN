@@ -86,11 +86,10 @@ try {
     # A non-physical adapter is accepted only if its own DNS server
     # can resolve the internal OCP Active Directory SRV record.
     $verifiedVpnAdapters = @()
-
+$physicalIfIndexes = @($physicalAdapters | ForEach-Object { $_.ifIndex })
     $virtualCandidates = @(Get-NetAdapter -ErrorAction Stop | Where-Object {
         $_.Status -eq 'Up' -and
-        $_.ifIndex -notin $physicalAdapters.ifIndex
-    })
+          -not ($physicalIfIndexes -contains $_.ifIndex)    })
 
     foreach ($adapter in $virtualCandidates) {
 
