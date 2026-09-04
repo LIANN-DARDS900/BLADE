@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Logs / reports / runtime state
+*.log
+logs/
+reports/
+state.json
+*.html
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets / environment overrides
+.env
+.env.*
+config.local.json
+
+# Packaging noise
+*.zip
+*.exe
