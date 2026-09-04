@@ -1,0 +1,24 @@
+name: Static Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python sources
+        run: python -m compileall -q app main.py scripts/static_validate.py
+
+      - name: Run BLADE static validation
+        run: python scripts/static_validate.py
