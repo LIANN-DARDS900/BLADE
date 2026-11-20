@@ -274,7 +274,7 @@ Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 ### 1. Clone
 
 ```powershell
-git clone https://github.com/LIANN-DARDS900/BLADE.git
+git clone https://github.com/ilyasnazih/BLADE.git
 cd BLADE
 ```
 
